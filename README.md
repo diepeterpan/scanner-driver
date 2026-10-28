@@ -6,6 +6,10 @@ An open-source SANE backend and standalone driver utility for the **Ricoh SP 112
 
 ## Supported Hardware
 
+| Ricoh SP 112SF | Ricoh SP 112SU |
+|:---:|:---:|
+| ![Ricoh SP 112SF](images/ricoh-sp112sf.jpg) | ![Ricoh SP 112SU](images/ricoh-sp112su.jpg) |
+
 | Model | Hardware Profile | USB VID / PID | USB Interface Endpoints |
 |---|---|---|---|
 | **Ricoh SP 112SF** | 4-in-1 (Flatbed + Automatic Document Feeder) | `05CA:0449` | EP `0x03` (OUT), EP `0x84` (Control IN), EP `0x85` (Raster IN) |
