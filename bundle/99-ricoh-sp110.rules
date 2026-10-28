@@ -1,0 +1,8 @@
+# Udev rules for Ricoh SP 110 Series Multifunction Scanners
+# Grants read/write permissions to users in the 'scanner' and 'lp' groups
+
+# Ricoh SP 112SU (3-in-1)
+ATTRS{idVendor}=="05ca", ATTRS{idProduct}=="0448", MODE="0664", GROUP="scanner", ENV{libsane_matched}="yes"
+
+# Ricoh SP 112SF (4-in-1 with ADF)
+ATTRS{idVendor}=="05ca", ATTRS{idProduct}=="0449", MODE="0664", GROUP="scanner", ENV{libsane_matched}="yes"

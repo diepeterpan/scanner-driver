@@ -1,0 +1,23 @@
+# Binary drivers and proprietary installer packages
+*.exe
+*.dll
+*.ds
+*.inf
+
+# Proprietary extracted driver trees, reverse engineering workspace & decompiler outputs
+ricoh_112sf_scanner_driver/
+re_x64/
+tools/
+README_INTERNAL.md
+
+# Compiled C binaries, objects & test scans
+*.o
+*.so
+*.so.*
+*.pnm
+*.png
+
+# Python environment and caches
+.venv/
+__pycache__/
+*.pyc
