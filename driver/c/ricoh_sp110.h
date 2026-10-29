@@ -16,10 +16,10 @@
 
 #define INTERFACE_SCANNER         0
 #define ENDPOINT_BULK_OUT_DEFAULT 0x03   /* EP 3 OUT: Command writes (64-byte framing packets) */
-#define ENDPOINT_RESP_IN_DEFAULT  0x84   /* EP 4 IN: Command responses, Status (0x0D), Homing ACK (0x09), Caps (0x0B) */
-#define ENDPOINT_RASTER_IN_DEFAULT 0x85  /* EP 5 IN: High-speed raster image streaming */
-#define ENDPOINT_BULK_IN_DEFAULT  0x84   /* Legacy alias for command response pipe */
-#define ENDPOINT_BULK_ALT_DEFAULT 0x85   /* Legacy alias for raster stream pipe */
+#define ENDPOINT_RESP_IN_DEFAULT  0x85   /* EP 5 IN (Usbscan pipe \2): Command responses & status */
+#define ENDPOINT_RASTER_IN_DEFAULT 0x85  /* EP 5 IN (Usbscan pipe \2): High-speed raster image streaming */
+#define ENDPOINT_BULK_IN_DEFAULT  0x85   /* Primary IN pipe (0x85) */
+#define ENDPOINT_BULK_ALT_DEFAULT 0x84   /* Secondary IN pipe (0x84) */
 
 #define CMD_PACKET_LEN       64
 #define CMD_PREAMBLE         0x03

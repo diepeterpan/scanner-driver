@@ -73,9 +73,8 @@ static void detect_endpoints(libusb_device *dev, uint8_t *ep_out,
                 *ep_out = ep->bEndpointAddress;
               } else if ((ep->bEndpointAddress & LIBUSB_ENDPOINT_DIR_MASK) ==
                          LIBUSB_ENDPOINT_IN) {
-                if (ep->bEndpointAddress == ENDPOINT_RESP_IN_DEFAULT) {
+                if (ep->bEndpointAddress == ENDPOINT_RASTER_IN_DEFAULT) {
                   *ep_in = ep->bEndpointAddress;
-                } else if (ep->bEndpointAddress == ENDPOINT_RASTER_IN_DEFAULT) {
                   *ep_raster = ep->bEndpointAddress;
                 }
               }
@@ -117,18 +116,42 @@ static int receive_response_packet(libusb_device_handle *handle, uint8_t ep_in,
   int transferred = 0;
   int ret = libusb_bulk_transfer(handle, ep_in, resp, expected_len,
                                  &transferred, timeout_ms);
-  if (ret == 0 && transferred > 0) {
-    return transferred;
+  return (ret == 0 && transferred > 0) ? transferred : -1;
+}
+
+static int fetch_raster_chunk(Ricoh_Scanner *s, uint8_t *buf, size_t to_fetch,
+                              int timeout_ms) {
+  uint8_t start_payload[4];
+  start_payload[0] = (uint8_t)(to_fetch & 0xFF);
+  start_payload[1] = (uint8_t)((to_fetch >> 8) & 0xFF);
+  start_payload[2] = (uint8_t)((to_fetch >> 16) & 0xFF);
+  start_payload[3] = (uint8_t)((to_fetch >> 24) & 0xFF);
+  if (send_command_packet(s->usb_handle, s->ep_out, CMD_SUBTYPE_START,
+                          CMD_RESP_LEN_START, start_payload,
+                          sizeof(start_payload)) != 0) {
+    return -1;
   }
 
-  /* Dual-endpoint fallback: if primary endpoint timed out, try alternate */
-  uint8_t alt_ep = (ep_in == ENDPOINT_BULK_IN_DEFAULT)
-                       ? ENDPOINT_BULK_ALT_DEFAULT
-                       : ENDPOINT_BULK_IN_DEFAULT;
-  transferred = 0;
-  ret = libusb_bulk_transfer(handle, alt_ep, resp, expected_len,
-                             &transferred, timeout_ms / 2);
-  return (ret == 0 && transferred > 0) ? transferred : -1;
+  size_t total_read = 0;
+  while (total_read < to_fetch) {
+    int transferred = 0;
+    int ret = libusb_bulk_transfer(
+        s->usb_handle, s->ep_raster, buf + total_read,
+        (int)(to_fetch - total_read), &transferred,
+        (total_read == 0) ? timeout_ms : 5000);
+    if (ret != 0 || transferred <= 0) {
+      if (total_read == 0) {
+        fprintf(stderr,
+                "[ricoh_sp110] raster read failed: libusb error %d (%s), "
+                "transferred %d bytes\n",
+                ret, libusb_error_name(ret), transferred);
+        return -1;
+      }
+      break;
+    }
+    total_read += (size_t)transferred;
+  }
+  return (int)total_read;
 }
 
 static SANE_Status query_scanner_status(Ricoh_Scanner *s, int *has_paper,
@@ -143,10 +166,7 @@ static SANE_Status query_scanner_status(Ricoh_Scanner *s, int *has_paper,
   int rlen = receive_response_packet(s->usb_handle, s->ep_in, resp,
                                      sizeof(resp), 5000);
   if (rlen < 1) {
-    /* If status query timed out, proceed gracefully with defaults */
-    if (has_paper) *has_paper = 1;
-    if (cover_open) *cover_open = 0;
-    return SANE_STATUS_GOOD;
+    return SANE_STATUS_IO_ERROR;
   }
 
   if (has_paper) {
@@ -159,19 +179,53 @@ static SANE_Status query_scanner_status(Ricoh_Scanner *s, int *has_paper,
   return SANE_STATUS_GOOD;
 }
 
-static void close_scan_session(Ricoh_Scanner *s) {
+static void close_scan_session(Ricoh_Scanner *s, SANE_Bool abort_scan) {
   if (!s || !s->usb_handle) {
     return;
   }
-  /* Step 8: Close active scan session (Command 7, 0x0A): Write-Only */
-  send_command_packet(s->usb_handle, s->ep_out, CMD_SUBTYPE_END_SCAN,
-                      CMD_RESP_LEN_END_SCAN, NULL, 0);
+  if (abort_scan) {
+    /* Aborted mid-scan: explicitly send EndScan (Command 7, 0x0A): Write-Only */
+    send_command_packet(s->usb_handle, s->ep_out, CMD_SUBTYPE_END_SCAN,
+                        CMD_RESP_LEN_END_SCAN, NULL, 0);
+  } else {
+    /* Before closing a normal scan session, ensure all hardware bytes declared
+     * in CMD_LampControl (0x08) have been drained from the scanner's raster
+     * pipeline (matching Windows WIA/TWAIN drivers where DAT_1800490d8 == 0). */
+    if (s->hw_bytes_received < s->hw_total_bytes && s->raw_chunk_buf &&
+        s->hw_bytes_per_line > 0) {
+      int hw_bpl = s->hw_bytes_per_line;
+      int lines_per_chunk = (hw_bpl <= 65535) ? (65535 / hw_bpl) : 1;
+      if (lines_per_chunk < 1) {
+        lines_per_chunk = 1;
+      }
+      size_t max_chunk = (size_t)(lines_per_chunk * hw_bpl);
+      if (max_chunk > s->raw_chunk_alloc) {
+        max_chunk = s->raw_chunk_alloc;
+      }
+      while (s->hw_bytes_received < s->hw_total_bytes) {
+        size_t rem = s->hw_total_bytes - s->hw_bytes_received;
+        size_t drain_len = (rem > max_chunk) ? max_chunk : rem;
+        int got = fetch_raster_chunk(s, s->raw_chunk_buf, drain_len, 5000);
+        if (got <= 0) {
+          break;
+        }
+        s->hw_bytes_received += (size_t)got;
+      }
+    }
 
-  /* Step 9: Post-scan carriage homing / parking (Command 3, 0x09): Reads 1-byte ACK */
-  uint8_t ack = 0;
-  if (send_command_packet(s->usb_handle, s->ep_out, CMD_SUBTYPE_CANCEL,
-                          CMD_RESP_LEN_CANCEL, NULL, 0) == 0) {
-    receive_response_packet(s->usb_handle, s->ep_in, &ack, sizeof(ack), 1000);
+    /* Normal scan completion: poll carriage status (Command 3, 0x09) first,
+     * matching original Windows WIA/TWAIN drivers (FUN_10031180 / scan_session_sequence).
+     * Only send EndScan (0x0A) if the status byte is non-zero. */
+    uint8_t ack = 0xFF;
+    int rlen = -1;
+    if (send_command_packet(s->usb_handle, s->ep_out, CMD_SUBTYPE_CANCEL,
+                            CMD_RESP_LEN_CANCEL, NULL, 0) == 0) {
+      rlen = receive_response_packet(s->usb_handle, s->ep_in, &ack, sizeof(ack), 1000);
+    }
+    if (rlen < 1 || ack != 0) {
+      send_command_packet(s->usb_handle, s->ep_out, CMD_SUBTYPE_END_SCAN,
+                          CMD_RESP_LEN_END_SCAN, NULL, 0);
+    }
   }
 }
 
@@ -803,6 +857,11 @@ SANE_Status sane_ricoh_sp110_start(SANE_Handle handle) {
   /* Hardware ScanMode: gray/lineart -> 0x02, color -> 0x03 */
   payload[1] = (strcmp(s->val_mode, SANE_VALUE_SCAN_MODE_COLOR) == 0) ? 0x03 : 0x02;
 
+  /* Default brightness (0x05) and Custom window paper size ID (0xFF),
+   * matching original Windows WIA/TWAIN drivers (FUN_180001000 / FUN_10030bb0). */
+  payload[2] = 0x05;
+  payload[3] = 0xFF;
+
   /* Geometry coordinates: Scaled to 600 DPI base units per original driver:
    * coord_600 = (coord_dpi * 600) / requested_dpi.
    * For 200 DPI, (px * 600)/200 = px * 3 = 1.5 * (px at 300 DPI). */
@@ -871,14 +930,7 @@ SANE_Status sane_ricoh_sp110_start(SANE_Handle handle) {
   s->hw_total_bytes = (size_t)s->hw_bytes_per_line * (size_t)s->hw_lines;
   s->expected_bytes = s->params.bytes_per_line * s->params.lines;
 
-  /* Step 5: Pre-calibration carriage homing (Command 3, 0x09): Reads 1-byte ACK */
-  uint8_t reset_ack = 0;
-  if (send_command_packet(s->usb_handle, s->ep_out, CMD_SUBTYPE_CANCEL,
-                          CMD_RESP_LEN_CANCEL, NULL, 0) == 0) {
-    receive_response_packet(s->usb_handle, s->ep_in, &reset_ack, sizeof(reset_ack), 3000);
-  }
-
-  /* Step 6: Lamp calibration & control (Command 5, 0x08): Write-Only
+  /* Step 5: Lamp calibration & control (Command 5, 0x08): Write-Only
    * Payload: total hardware bytes (4 bytes little-endian) + 0x01 flag
    */
   uint32_t total_hw_bytes = (uint32_t)s->hw_total_bytes;
@@ -915,7 +967,7 @@ SANE_Status sane_ricoh_sp110_read(SANE_Handle handle, SANE_Byte *data,
   }
   if (s->bytes_transferred >= s->expected_bytes) {
     s->scanning = SANE_FALSE;
-    close_scan_session(s);
+    close_scan_session(s, SANE_FALSE);
     return SANE_STATUS_EOF;
   }
 
@@ -933,7 +985,7 @@ SANE_Status sane_ricoh_sp110_read(SANE_Handle handle, SANE_Byte *data,
     *length = (SANE_Int)to_copy;
     if (s->bytes_transferred >= s->expected_bytes) {
       s->scanning = SANE_FALSE;
-      close_scan_session(s);
+      close_scan_session(s, SANE_FALSE);
     }
     return SANE_STATUS_GOOD;
   }
@@ -941,7 +993,7 @@ SANE_Status sane_ricoh_sp110_read(SANE_Handle handle, SANE_Byte *data,
   /* Check if all physical data from hardware has already been read */
   if (s->hw_bytes_received >= s->hw_total_bytes) {
     s->scanning = SANE_FALSE;
-    close_scan_session(s);
+    close_scan_session(s, SANE_FALSE);
     return SANE_STATUS_EOF;
   }
 
@@ -986,39 +1038,18 @@ SANE_Status sane_ricoh_sp110_read(SANE_Handle handle, SANE_Byte *data,
   s->out_buf_len = 0;
   s->out_buf_pos = 0;
 
-  /* Step 7: Dispatch CMD_StartScan (Command 6, 0x0E) with requested chunk size */
-  uint8_t start_payload[4];
-  start_payload[0] = (uint8_t)(to_fetch & 0xFF);
-  start_payload[1] = (uint8_t)((to_fetch >> 8) & 0xFF);
-  start_payload[2] = (uint8_t)((to_fetch >> 16) & 0xFF);
-  start_payload[3] = (uint8_t)((to_fetch >> 24) & 0xFF);
-  if (send_command_packet(s->usb_handle, s->ep_out, CMD_SUBTYPE_START,
-                          CMD_RESP_LEN_START, start_payload, sizeof(start_payload)) != 0) {
-    return SANE_STATUS_IO_ERROR;
-  }
-
-  int transferred = 0;
-  /* First chunk allows lamp warm-up and motor acceleration (20s) */
+  /* Step 7: Dispatch CMD_StartScan (Command 6, 0x0E) and read full requested chunk */
   int timeout_ms = (s->hw_bytes_received == 0) ? 20000 : 10000;
-  int ret = libusb_bulk_transfer(s->usb_handle, s->ep_raster, s->raw_chunk_buf,
-                                 (int)to_fetch, &transferred, timeout_ms);
+  int transferred = fetch_raster_chunk(s, s->raw_chunk_buf, to_fetch, timeout_ms);
 
-  if (ret != 0 || transferred == 0) {
-    /* Fallback to ep_in (0x84) if raster pipe timed out */
-    transferred = 0;
-    ret = libusb_bulk_transfer(s->usb_handle, s->ep_in, s->raw_chunk_buf,
-                               (int)to_fetch, &transferred, 3000);
-  }
-
-  if (ret != 0 || transferred <= 0) {
+  if (transferred <= 0) {
     if (s->bytes_transferred > 0) {
       s->scanning = SANE_FALSE;
-      close_scan_session(s);
+      close_scan_session(s, SANE_FALSE);
       return SANE_STATUS_EOF;
     }
-    fprintf(stderr, "[ricoh_sp110] sane_read failed: libusb error %d (%s), transferred %d bytes\n",
-            ret, libusb_error_name(ret), transferred);
-    close_scan_session(s);
+    s->scanning = SANE_FALSE;
+    close_scan_session(s, SANE_TRUE);
     return SANE_STATUS_IO_ERROR;
   }
 
@@ -1149,7 +1180,7 @@ SANE_Status sane_ricoh_sp110_read(SANE_Handle handle, SANE_Byte *data,
 
   if (s->bytes_transferred >= s->expected_bytes) {
     s->scanning = SANE_FALSE;
-    close_scan_session(s);
+    close_scan_session(s, SANE_FALSE);
   }
 
   return SANE_STATUS_GOOD;
@@ -1159,8 +1190,10 @@ void sane_ricoh_sp110_cancel(SANE_Handle handle) {
   Ricoh_Scanner *s = (Ricoh_Scanner *)handle;
   if (s && s->usb_handle) {
     s->cancelled = SANE_TRUE;
-    close_scan_session(s);
-    s->scanning = SANE_FALSE;
+    if (s->scanning) {
+      s->scanning = SANE_FALSE;
+      close_scan_session(s, SANE_TRUE);
+    }
   }
 }
 
