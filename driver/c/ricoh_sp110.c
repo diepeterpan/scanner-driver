@@ -22,7 +22,7 @@ static const SANE_String_Const source_list_sf[] = {"Flatbed", "ADF", NULL};
 
 static const SANE_String_Const source_list_su[] = {"Flatbed", NULL};
 
-static const SANE_Int resolution_list[] = {4, 100, 200, 300, 600};
+static const SANE_Int resolution_list[] = {6, 75, 100, 150, 200, 300, 600};
 
 typedef struct {
     const char *name;
@@ -177,6 +177,29 @@ static SANE_Status query_scanner_status(Ricoh_Scanner *s, int *has_paper,
   }
 
   return SANE_STATUS_GOOD;
+}
+
+static void build_tone_lut(Ricoh_Scanner *s) {
+  int b = s->val_brightness;
+  int c = s->val_contrast;
+  int slope;
+  if (c < 0) {
+    slope = 10000 / (100 - c * 3);
+  } else {
+    slope = (c * 300 + 10000) / 100;
+  }
+  int val = (100 - slope) * 128 + b * 100;
+  for (int i = 0; i < 256; i++) {
+    int p = val / 100;
+    if (p < 0) {
+      s->lut[i] = 0;
+    } else if (p > 255) {
+      s->lut[i] = 255;
+    } else {
+      s->lut[i] = (uint8_t)p;
+    }
+    val += slope;
+  }
 }
 
 static void close_scan_session(Ricoh_Scanner *s, SANE_Bool abort_scan) {
@@ -470,6 +493,24 @@ SANE_Status sane_ricoh_sp110_open(SANE_String_Const devicename,
   s->y_range.max = SANE_FIX(355.6); /* Up to Legal for ADF */
   s->y_range.quant = 0;
 
+  /* Enhancement ranges & defaults */
+  s->brightness_range.min = -100;
+  s->brightness_range.max = 100;
+  s->brightness_range.quant = 1;
+
+  s->contrast_range.min = -100;
+  s->contrast_range.max = 100;
+  s->contrast_range.quant = 1;
+
+  s->threshold_range.min = 0;
+  s->threshold_range.max = 255;
+  s->threshold_range.quant = 1;
+
+  s->val_brightness = 0;
+  s->val_contrast = 0;
+  s->val_threshold = 128;
+  build_tone_lut(s);
+
   *handle = (SANE_Handle)s;
   return SANE_STATUS_GOOD;
 }
@@ -642,6 +683,56 @@ sane_ricoh_sp110_get_option_descriptor(SANE_Handle handle, SANE_Int option) {
       opt->constraint.range = &s->y_range;
     }
     break;
+
+  case OPT_ENHANCEMENT_GROUP:
+    opt->name = "";
+    opt->title = "Enhancement Options";
+    opt->desc = "Image brightness, contrast, and lineart threshold adjustments";
+    opt->type = SANE_TYPE_GROUP;
+    opt->unit = SANE_UNIT_NONE;
+    opt->size = 0;
+    opt->cap = 0;
+    opt->constraint_type = SANE_CONSTRAINT_NONE;
+    break;
+
+  case OPT_BRIGHTNESS:
+    opt->name = SANE_NAME_BRIGHTNESS;
+    opt->title = SANE_TITLE_BRIGHTNESS;
+    opt->desc = SANE_DESC_BRIGHTNESS;
+    opt->type = SANE_TYPE_INT;
+    opt->unit = SANE_UNIT_PERCENT;
+    opt->size = sizeof(SANE_Int);
+    opt->cap = SANE_CAP_SOFT_SELECT | SANE_CAP_SOFT_DETECT | SANE_CAP_AUTOMATIC;
+    opt->constraint_type = SANE_CONSTRAINT_RANGE;
+    opt->constraint.range = &s->brightness_range;
+    break;
+
+  case OPT_CONTRAST:
+    opt->name = SANE_NAME_CONTRAST;
+    opt->title = SANE_TITLE_CONTRAST;
+    opt->desc = SANE_DESC_CONTRAST;
+    opt->type = SANE_TYPE_INT;
+    opt->unit = SANE_UNIT_PERCENT;
+    opt->size = sizeof(SANE_Int);
+    opt->cap = SANE_CAP_SOFT_SELECT | SANE_CAP_SOFT_DETECT | SANE_CAP_AUTOMATIC;
+    opt->constraint_type = SANE_CONSTRAINT_RANGE;
+    opt->constraint.range = &s->contrast_range;
+    break;
+
+  case OPT_THRESHOLD:
+    opt->name = SANE_NAME_THRESHOLD;
+    opt->title = SANE_TITLE_THRESHOLD;
+    opt->desc = SANE_DESC_THRESHOLD;
+    opt->type = SANE_TYPE_INT;
+    opt->unit = SANE_UNIT_NONE;
+    opt->size = sizeof(SANE_Int);
+    opt->cap = SANE_CAP_SOFT_SELECT | SANE_CAP_SOFT_DETECT | SANE_CAP_AUTOMATIC;
+    if (strcmp(s->val_mode, SANE_VALUE_SCAN_MODE_LINEART) != 0) {
+      opt->cap |= SANE_CAP_INACTIVE;
+    }
+    opt->constraint_type = SANE_CONSTRAINT_RANGE;
+    opt->constraint.range = &s->threshold_range;
+    break;
   }
   return opt;
 }
@@ -718,10 +809,37 @@ SANE_Status sane_ricoh_sp110_control_option(SANE_Handle handle, SANE_Int option,
     case OPT_BR_Y:
       *(SANE_Fixed *)val = s->val_br_y;
       break;
+    case OPT_BRIGHTNESS:
+      *(SANE_Int *)val = s->val_brightness;
+      break;
+    case OPT_CONTRAST:
+      *(SANE_Int *)val = s->val_contrast;
+      break;
+    case OPT_THRESHOLD:
+      *(SANE_Int *)val = s->val_threshold;
+      break;
     default:
       return SANE_STATUS_INVAL;
     }
     return SANE_STATUS_GOOD;
+  }
+
+  if (action == SANE_ACTION_SET_AUTO) {
+    switch (option) {
+    case OPT_BRIGHTNESS:
+      s->val_brightness = 0;
+      build_tone_lut(s);
+      return SANE_STATUS_GOOD;
+    case OPT_CONTRAST:
+      s->val_contrast = 0;
+      build_tone_lut(s);
+      return SANE_STATUS_GOOD;
+    case OPT_THRESHOLD:
+      s->val_threshold = 128;
+      return SANE_STATUS_GOOD;
+    default:
+      return SANE_STATUS_UNSUPPORTED;
+    }
   }
 
   if (action == SANE_ACTION_SET_VALUE) {
@@ -730,7 +848,7 @@ SANE_Status sane_ricoh_sp110_control_option(SANE_Handle handle, SANE_Int option,
       free(s->val_mode);
       s->val_mode = strdup((char *)val);
       if (info)
-        *info |= SANE_INFO_RELOAD_PARAMS;
+        *info |= SANE_INFO_RELOAD_PARAMS | SANE_INFO_RELOAD_OPTIONS;
       break;
     case OPT_RESOLUTION:
       s->val_resolution = *(SANE_Int *)val;
@@ -779,6 +897,29 @@ SANE_Status sane_ricoh_sp110_control_option(SANE_Handle handle, SANE_Int option,
       s->val_paper_size = strdup("Custom");
       if (info) *info |= SANE_INFO_RELOAD_PARAMS;
       break;
+    case OPT_BRIGHTNESS: {
+      SANE_Int v = *(SANE_Int *)val;
+      if (v < -100) v = -100;
+      if (v > 100) v = 100;
+      s->val_brightness = v;
+      build_tone_lut(s);
+      break;
+    }
+    case OPT_CONTRAST: {
+      SANE_Int v = *(SANE_Int *)val;
+      if (v < -100) v = -100;
+      if (v > 100) v = 100;
+      s->val_contrast = v;
+      build_tone_lut(s);
+      break;
+    }
+    case OPT_THRESHOLD: {
+      SANE_Int v = *(SANE_Int *)val;
+      if (v < 0) v = 0;
+      if (v > 255) v = 255;
+      s->val_threshold = v;
+      break;
+    }
     default:
       return SANE_STATUS_INVAL;
     }
@@ -840,10 +981,12 @@ SANE_Status sane_ricoh_sp110_start(SANE_Handle handle) {
     receive_response_packet(s->usb_handle, s->ep_in, &pre_ack, sizeof(pre_ack), 3000);
   }
 
+  s->downscale_75 = (s->val_resolution == 75) ? SANE_TRUE : SANE_FALSE;
   s->downscale_100 = (s->val_resolution == 100) ? SANE_TRUE : SANE_FALSE;
+  s->downscale_150 = (s->val_resolution == 150) ? SANE_TRUE : SANE_FALSE;
   s->downscale_200 = (s->val_resolution == 200) ? SANE_TRUE : SANE_FALSE;
   /* Hardware only supports 300 DPI (0x01) and 600 DPI (0x02) optical stepping.
-   * Both 100 DPI and 200 DPI are captured at 300 DPI hardware resolution. */
+   * 75/100/150/200 DPI are captured at 300 DPI hardware resolution. */
   int hw_dpi = (s->val_resolution >= 600) ? 600 : 300;
   s->hw_line_index = 0;
 
@@ -851,7 +994,7 @@ SANE_Status sane_ricoh_sp110_start(SANE_Handle handle) {
   uint8_t payload[17];
   memset(payload, 0, sizeof(payload));
 
-  /* Resolution code: 100/200/300 DPI -> 0x01, 600 DPI -> 0x02 */
+  /* Resolution code: 75/100/150/200/300 DPI -> 0x01, 600 DPI -> 0x02 */
   payload[0] = (hw_dpi >= 600) ? 0x02 : 0x01;
 
   /* Hardware ScanMode: gray/lineart -> 0x02, color -> 0x03 */
@@ -865,8 +1008,21 @@ SANE_Status sane_ricoh_sp110_start(SANE_Handle handle) {
   /* Geometry coordinates: Scaled to 600 DPI base units per original driver:
    * coord_600 = (coord_dpi * 600) / requested_dpi.
    * For 200 DPI, (px * 600)/200 = px * 3 = 1.5 * (px at 300 DPI). */
+  double tl_x_mm = SANE_UNFIX(s->val_tl_x);
+  double tl_y_mm = SANE_UNFIX(s->val_tl_y);
+  if (tl_x_mm < 0.0) tl_x_mm = 0.0;
+  if (tl_y_mm < 0.0) tl_y_mm = 0.0;
+  uint16_t start_x_600 = (uint16_t)((tl_x_mm / 25.4) * 600.0);
+  uint16_t start_y_600 = (uint16_t)((tl_y_mm / 25.4) * 600.0);
   uint16_t w_600 = (uint16_t)((s->params.pixels_per_line * 600) / s->val_resolution);
   uint16_t h_600 = (uint16_t)((s->params.lines * 600) / s->val_resolution);
+  if (start_x_600 + w_600 > 5100) {
+    start_x_600 = (w_600 < 5100) ? (5100 - w_600) : 0;
+  }
+  uint16_t max_y_600 = (strcmp(s->val_source, "ADF") == 0) ? 8400 : 7016;
+  if (start_y_600 + h_600 > max_y_600) {
+    start_y_600 = (h_600 < max_y_600) ? (max_y_600 - h_600) : 0;
+  }
 
   /* Calculate expected physical 300/600 DPI hardware pixel and line counts */
   int hw_req_pixels = (w_600 * hw_dpi) / 600;
@@ -878,10 +1034,10 @@ SANE_Status sane_ricoh_sp110_start(SANE_Handle handle) {
     hw_req_lines++;
   }
 
-  payload[4] = 0;
-  payload[5] = 0; /* StartX */
-  payload[6] = 0;
-  payload[7] = 0; /* StartY */
+  payload[4] = (uint8_t)(start_x_600 & 0xFF);
+  payload[5] = (uint8_t)(start_x_600 >> 8); /* StartX */
+  payload[6] = (uint8_t)(start_y_600 & 0xFF);
+  payload[7] = (uint8_t)(start_y_600 >> 8); /* StartY */
   payload[8] = (uint8_t)(w_600 & 0xFF);
   payload[9] = (uint8_t)(w_600 >> 8);
   payload[10] = (uint8_t)(h_600 & 0xFF);
@@ -1058,18 +1214,28 @@ SANE_Status sane_ricoh_sp110_read(SANE_Handle handle, SANE_Byte *data,
   int out_bpl = s->params.bytes_per_line;
   int active_pixels = s->params.pixels_per_line;
   int hw_pitch = s->hw_pixels_per_line;
+  const uint8_t *lut = s->lut;
+  int threshold = s->val_threshold;
 
   for (int l = 0; l < lines_in_chunk; l++) {
     int current_line_idx = s->hw_line_index++;
 
     /* Downscaling vertical line selection from 300 DPI hardware stream:
      * - 200 DPI (3:2 downscale): keep 2 out of every 3 lines (drop line % 3 == 2)
+     * - 150 DPI (2:1 downscale): keep 1 out of every 2 lines (keep line % 2 == 0)
      * - 100 DPI (3:1 downscale): keep 1 out of every 3 lines (keep line % 3 == 0)
+     * -  75 DPI (4:1 downscale): keep 1 out of every 4 lines (keep line % 4 == 0)
      */
     if (s->downscale_200 && (current_line_idx % 3 == 2)) {
       continue;
     }
+    if (s->downscale_150 && (current_line_idx % 2 != 0)) {
+      continue;
+    }
     if (s->downscale_100 && (current_line_idx % 3 != 0)) {
+      continue;
+    }
+    if (s->downscale_75 && (current_line_idx % 4 != 0)) {
       continue;
     }
 
@@ -1086,21 +1252,46 @@ SANE_Status sane_ricoh_sp110_read(SANE_Handle handle, SANE_Byte *data,
         const uint8_t *b_plane = hw_line + hw_pitch * 2;
         for (int p = 0; p < active_pixels; p++) {
           int src_p = (p / 2) * 3 + (p % 2);
-          dst[p * 3 + 0] = r_plane[src_p];
-          dst[p * 3 + 1] = g_plane[src_p];
-          dst[p * 3 + 2] = b_plane[src_p];
+          dst[p * 3 + 0] = lut[r_plane[src_p]];
+          dst[p * 3 + 1] = lut[g_plane[src_p]];
+          dst[p * 3 + 2] = lut[b_plane[src_p]];
         }
       } else if (strcmp(s->val_mode, SANE_VALUE_SCAN_MODE_GRAY) == 0) {
         for (int p = 0; p < active_pixels; p++) {
           int src_p = (p / 2) * 3 + (p % 2);
-          dst[p] = hw_line[src_p];
+          dst[p] = lut[hw_line[src_p]];
         }
       } else {
         /* 1-bit Lineart */
         memset(dst, 0, (size_t)out_bpl);
         for (int p = 0; p < active_pixels; p++) {
           int src_p = (p / 2) * 3 + (p % 2);
-          if (hw_line[src_p] < 128) {
+          if (lut[hw_line[src_p]] < threshold) {
+            dst[p / 8] |= (uint8_t)(1 << (7 - (p % 8)));
+          }
+        }
+      }
+    } else if (s->downscale_150) {
+      /* 150 DPI (2:1 downscaling): keep every 2nd pixel (0, 2, 4...) */
+      if (strcmp(s->val_mode, SANE_VALUE_SCAN_MODE_COLOR) == 0) {
+        const uint8_t *r_plane = hw_line;
+        const uint8_t *g_plane = hw_line + hw_pitch;
+        const uint8_t *b_plane = hw_line + hw_pitch * 2;
+        for (int p = 0; p < active_pixels; p++) {
+          int src_p = p * 2;
+          dst[p * 3 + 0] = lut[r_plane[src_p]];
+          dst[p * 3 + 1] = lut[g_plane[src_p]];
+          dst[p * 3 + 2] = lut[b_plane[src_p]];
+        }
+      } else if (strcmp(s->val_mode, SANE_VALUE_SCAN_MODE_GRAY) == 0) {
+        for (int p = 0; p < active_pixels; p++) {
+          dst[p] = lut[hw_line[p * 2]];
+        }
+      } else {
+        /* 1-bit Lineart */
+        memset(dst, 0, (size_t)out_bpl);
+        for (int p = 0; p < active_pixels; p++) {
+          if (lut[hw_line[p * 2]] < threshold) {
             dst[p / 8] |= (uint8_t)(1 << (7 - (p % 8)));
           }
         }
@@ -1113,19 +1304,44 @@ SANE_Status sane_ricoh_sp110_read(SANE_Handle handle, SANE_Byte *data,
         const uint8_t *b_plane = hw_line + hw_pitch * 2;
         for (int p = 0; p < active_pixels; p++) {
           int src_p = p * 3;
-          dst[p * 3 + 0] = r_plane[src_p];
-          dst[p * 3 + 1] = g_plane[src_p];
-          dst[p * 3 + 2] = b_plane[src_p];
+          dst[p * 3 + 0] = lut[r_plane[src_p]];
+          dst[p * 3 + 1] = lut[g_plane[src_p]];
+          dst[p * 3 + 2] = lut[b_plane[src_p]];
         }
       } else if (strcmp(s->val_mode, SANE_VALUE_SCAN_MODE_GRAY) == 0) {
         for (int p = 0; p < active_pixels; p++) {
-          dst[p] = hw_line[p * 3];
+          dst[p] = lut[hw_line[p * 3]];
         }
       } else {
         /* 1-bit Lineart */
         memset(dst, 0, (size_t)out_bpl);
         for (int p = 0; p < active_pixels; p++) {
-          if (hw_line[p * 3] < 128) {
+          if (lut[hw_line[p * 3]] < threshold) {
+            dst[p / 8] |= (uint8_t)(1 << (7 - (p % 8)));
+          }
+        }
+      }
+    } else if (s->downscale_75) {
+      /* 75 DPI (4:1 downscaling): keep every 4th pixel (0, 4, 8...) */
+      if (strcmp(s->val_mode, SANE_VALUE_SCAN_MODE_COLOR) == 0) {
+        const uint8_t *r_plane = hw_line;
+        const uint8_t *g_plane = hw_line + hw_pitch;
+        const uint8_t *b_plane = hw_line + hw_pitch * 2;
+        for (int p = 0; p < active_pixels; p++) {
+          int src_p = p * 4;
+          dst[p * 3 + 0] = lut[r_plane[src_p]];
+          dst[p * 3 + 1] = lut[g_plane[src_p]];
+          dst[p * 3 + 2] = lut[b_plane[src_p]];
+        }
+      } else if (strcmp(s->val_mode, SANE_VALUE_SCAN_MODE_GRAY) == 0) {
+        for (int p = 0; p < active_pixels; p++) {
+          dst[p] = lut[hw_line[p * 4]];
+        }
+      } else {
+        /* 1-bit Lineart */
+        memset(dst, 0, (size_t)out_bpl);
+        for (int p = 0; p < active_pixels; p++) {
+          if (lut[hw_line[p * 4]] < threshold) {
             dst[p / 8] |= (uint8_t)(1 << (7 - (p % 8)));
           }
         }
@@ -1138,17 +1354,19 @@ SANE_Status sane_ricoh_sp110_read(SANE_Handle handle, SANE_Byte *data,
         const uint8_t *g_plane = hw_line + hw_pitch;
         const uint8_t *b_plane = hw_line + hw_pitch * 2;
         for (int p = 0; p < active_pixels; p++) {
-          dst[p * 3 + 0] = r_plane[p];
-          dst[p * 3 + 1] = g_plane[p];
-          dst[p * 3 + 2] = b_plane[p];
+          dst[p * 3 + 0] = lut[r_plane[p]];
+          dst[p * 3 + 1] = lut[g_plane[p]];
+          dst[p * 3 + 2] = lut[b_plane[p]];
         }
       } else if (strcmp(s->val_mode, SANE_VALUE_SCAN_MODE_GRAY) == 0) {
-        memcpy(dst, hw_line, (size_t)out_bpl);
+        for (int p = 0; p < active_pixels; p++) {
+          dst[p] = lut[hw_line[p]];
+        }
       } else {
-        /* 1-bit Lineart: threshold 8-bit grayscale at 128 (0=white, 1=black per SANE standard) */
+        /* 1-bit Lineart: threshold 8-bit grayscale at s->val_threshold (0=white, 1=black per SANE standard) */
         memset(dst, 0, (size_t)out_bpl);
         for (int p = 0; p < active_pixels; p++) {
-          if (hw_line[p] < 128) {
+          if (lut[hw_line[p]] < threshold) {
             dst[p / 8] |= (uint8_t)(1 << (7 - (p % 8)));
           }
         }

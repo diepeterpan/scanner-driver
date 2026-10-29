@@ -69,6 +69,10 @@ enum {
     OPT_TL_Y,
     OPT_BR_X,
     OPT_BR_Y,
+    OPT_ENHANCEMENT_GROUP,
+    OPT_BRIGHTNESS,
+    OPT_CONTRAST,
+    OPT_THRESHOLD,
     NUM_OPTIONS
 };
 
@@ -84,7 +88,7 @@ typedef struct Ricoh_Scanner {
     Ricoh_Device *hw;
     libusb_device_handle *usb_handle;
     uint8_t ep_out;
-    uint8_t ep_in;         /* Command response pipe (EP 0x84) */
+    uint8_t ep_in;         /* Command response pipe (EP 0x85) */
     uint8_t ep_raster;     /* Dedicated raster streaming pipe (EP 0x85) */
 
     /* Configuration options */
@@ -92,6 +96,9 @@ typedef struct Ricoh_Scanner {
     SANE_Range res_range;
     SANE_Range x_range;
     SANE_Range y_range;
+    SANE_Range brightness_range;
+    SANE_Range contrast_range;
+    SANE_Range threshold_range;
 
     /* Option Values */
     char *val_mode;
@@ -102,6 +109,10 @@ typedef struct Ricoh_Scanner {
     SANE_Fixed val_tl_y;
     SANE_Fixed val_br_x;
     SANE_Fixed val_br_y;
+    SANE_Int val_brightness;
+    SANE_Int val_contrast;
+    SANE_Int val_threshold;
+    uint8_t lut[256];
 
     /* Active Scan State */
     SANE_Parameters params;
@@ -117,7 +128,9 @@ typedef struct Ricoh_Scanner {
     size_t hw_total_bytes;
     size_t hw_bytes_received;
     SANE_Bool adf_600_doubling;
+    SANE_Bool downscale_75;
     SANE_Bool downscale_100;
+    SANE_Bool downscale_150;
     SANE_Bool downscale_200;
     int hw_line_index;
 

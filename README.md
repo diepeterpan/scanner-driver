@@ -28,11 +28,14 @@ Both models share an identical USB packet protocol, with hardware capability aut
 - **Color & Grayscale Modes**:
   - **Color**: 24-bit RGB with real-time planar-to-interleaved pixel de-planarization.
   - **Grayscale**: 8-bit Gray (`SANE_FRAME_GRAY`).
-  - **Monochrome (Lineart)**: Fast software-binarized 1-bit Lineart emulation.
-- **Optical Resolution & Stepping**: Support for 100, 200, 300, and 600 DPI scanning (100 DPI implemented via fast on-the-fly 2:1 hardware subsampling).
+  - **Monochrome (Lineart)**: Fast software-binarized 1-bit Lineart with configurable `--threshold`.
+- **Optical & Subsampled Resolutions**: Support for **75, 100, 150, 200, 300, and 600 DPI** scanning (75, 100, 150, and 200 DPI implemented via fast on-the-fly subsampling from the 300 DPI hardware optical stream).
+- **Hardware Region Cropping & Enhancement Controls**:
+  - Full hardware scan window offset (`--tl-x`, `--tl-y`, `--br-x`, `--br-y`) and predefined paper sizes (`A4`, `A5`, `A6`, `B5`, `B6`, `Legal`, `Letter`, `Max`, `Custom`).
+  - Real-time 256-entry tone-mapping LUT for `--brightness` (`-100..100%`), `--contrast` (`-100..100%`), and 1-bit `--threshold` (`0..255`).
 - **Automatic Document Feeder (ADF)**:
-  - Real-time tray paper sensor polling (returns `SANE_STATUS_NO_DOCS` when tray is empty).
-  - Paper path jam sensing.
+  - Real-time tray paper sensor polling (returns `SANE_STATUS_NO_DOCS` when tray is empty for seamless multi-page batch scanning).
+  - Full hardware stream synchronization between pages.
   - Hardware line doubling support for high-speed 600 DPI feeding.
 - **Safe Session Management & Software Reset**:
   - Implements clean two-stage session teardown (`OP_FINISH_SCAN` followed by `OP_PARK_CARRIAGE`).
@@ -112,8 +115,11 @@ scanimage -d ricoh_sp110 --paper-size A5 --resolution 300 --mode Gray > test_a5.
 # Scan Legal from ADF (SP 112SF only)
 scanimage -d ricoh_sp110 --source ADF --paper-size Legal --resolution 300 --mode Gray > test_legal.pnm
 
-# Scan 300 DPI Monochrome (1-bit Lineart)
-scanimage -d ricoh_sp110 --resolution 300 --mode Lineart > test_lineart.pnm
+# Scan 150 DPI Monochrome (1-bit Lineart) with custom threshold
+scanimage -d ricoh_sp110 --resolution 150 --mode Lineart --threshold 180 --format=png -o test_lineart.png
+
+# Scan with brightness/contrast adjustment and custom crop region
+scanimage -d ricoh_sp110 --resolution 150 --mode Gray --brightness 20 --contrast 30 -l 30 -t 30 -x 100 -y 100 --format=png -o test_crop.png
 ```
 
 
