@@ -32,9 +32,11 @@ Both models share an identical USB packet protocol, with hardware capability aut
 - **Optical & Subsampled Resolutions**: Support for **75, 100, 150, 200, 300, and 600 DPI** scanning (75, 100, 150, and 200 DPI implemented via fast on-the-fly subsampling from the 300 DPI hardware optical stream).
 - **Hardware Region Cropping & Enhancement Controls**:
   - Full hardware scan window offset (`--tl-x`, `--tl-y`, `--br-x`, `--br-y`) and predefined paper sizes (`A4`, `A5`, `A6`, `B5`, `B6`, `Legal`, `Letter`, `Max`, `Custom`).
-  - Real-time 256-entry tone-mapping LUT for `--brightness` (`-100..100%`), `--contrast` (`-100..100%`), and 1-bit `--threshold` (`0..255`).
-- **Automatic Document Feeder (ADF)**:
-  - Real-time tray paper sensor polling (returns `SANE_STATUS_NO_DOCS` when tray is empty for seamless multi-page batch scanning).
+  - Real-time 256-entry tone-mapping LUT for `--brightness` (`-100..100%`), `--contrast` (`-100..100%`), `--negative` (`yes`/`no` color/grayscale/lineart inversion), and 1-bit `--threshold` (`0..255`).
+  - Standard `--preview` mode (`75 DPI` fast preview acquisition without overwriting target resolution).
+- **Automatic Document Feeder (ADF) & Hardware Sensors**:
+  - Real-time tray paper sensor polling (`--page-loaded` read-only hardware sensor option, plus `SANE_STATUS_NO_DOCS` when tray is empty for seamless multi-page batch scanning).
+  - Automatic paper jam detection and recovery (`SANE_STATUS_JAMMED`).
   - Full hardware stream synchronization between pages.
   - Hardware line doubling support for high-speed 600 DPI feeding.
 - **Safe Session Management & Software Reset**:
@@ -120,6 +122,13 @@ scanimage -d ricoh_sp110 --resolution 150 --mode Lineart --threshold 180 --forma
 
 # Scan with brightness/contrast adjustment and custom crop region
 scanimage -d ricoh_sp110 --resolution 150 --mode Gray --brightness 20 --contrast 30 -l 30 -t 30 -x 100 -y 100 --format=png -o test_crop.png
+
+# Fast 75 DPI preview scan and negative image inversion
+scanimage -d ricoh_sp110 --mode Color --preview=yes --format=png -o test_preview.png
+scanimage -d ricoh_sp110 --resolution 150 --mode Gray --negative=yes --format=png -o test_negative.png
+
+# Check live ADF paper tray sensor status
+scanimage -d ricoh_sp110 -A | grep page-loaded
 ```
 
 

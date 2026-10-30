@@ -62,6 +62,7 @@ enum {
     OPT_MODE,
     OPT_RESOLUTION,
     OPT_SOURCE,
+    OPT_PREVIEW,
     OPT_GEOMETRY_GROUP,
     OPT_PAPER_SIZE,
     OPT_PAGE_SIZE,
@@ -73,6 +74,9 @@ enum {
     OPT_BRIGHTNESS,
     OPT_CONTRAST,
     OPT_THRESHOLD,
+    OPT_NEGATIVE,
+    OPT_SENSOR_GROUP,
+    OPT_PAGE_LOADED,
     NUM_OPTIONS
 };
 
@@ -104,6 +108,7 @@ typedef struct Ricoh_Scanner {
     char *val_mode;
     SANE_Int val_resolution;
     char *val_source;
+    SANE_Bool val_preview;
     char *val_paper_size;
     SANE_Fixed val_tl_x;
     SANE_Fixed val_tl_y;
@@ -112,6 +117,8 @@ typedef struct Ricoh_Scanner {
     SANE_Int val_brightness;
     SANE_Int val_contrast;
     SANE_Int val_threshold;
+    SANE_Bool val_negative;
+    SANE_Bool last_has_paper;
     uint8_t lut[256];
 
     /* Active Scan State */

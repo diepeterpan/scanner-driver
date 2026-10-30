@@ -192,12 +192,11 @@ static void build_tone_lut(Ricoh_Scanner *s) {
   for (int i = 0; i < 256; i++) {
     int p = val / 100;
     if (p < 0) {
-      s->lut[i] = 0;
+      p = 0;
     } else if (p > 255) {
-      s->lut[i] = 255;
-    } else {
-      s->lut[i] = (uint8_t)p;
+      p = 255;
     }
+    s->lut[i] = s->val_negative ? (uint8_t)(255 - p) : (uint8_t)p;
     val += slope;
   }
 }
@@ -476,6 +475,7 @@ SANE_Status sane_ricoh_sp110_open(SANE_String_Const devicename,
   s->val_mode = strdup(SANE_VALUE_SCAN_MODE_COLOR);
   s->val_resolution = 300;
   s->val_source = strdup("Flatbed");
+  s->val_preview = SANE_FALSE;
   s->val_paper_size = strdup("Max");
 
   /* Default Letter/A4 geometry in mm (fixed-point SANE format) */
@@ -509,6 +509,8 @@ SANE_Status sane_ricoh_sp110_open(SANE_String_Const devicename,
   s->val_brightness = 0;
   s->val_contrast = 0;
   s->val_threshold = 128;
+  s->val_negative = SANE_FALSE;
+  s->last_has_paper = SANE_FALSE;
   build_tone_lut(s);
 
   *handle = (SANE_Handle)s;
@@ -612,6 +614,17 @@ sane_ricoh_sp110_get_option_descriptor(SANE_Handle handle, SANE_Int option) {
     opt->constraint_type = SANE_CONSTRAINT_STRING_LIST;
     opt->constraint.string_list =
         (s->hw && s->hw->pid == PID_SP112SF) ? source_list_sf : source_list_su;
+    break;
+
+  case OPT_PREVIEW:
+    opt->name = SANE_NAME_PREVIEW;
+    opt->title = SANE_TITLE_PREVIEW;
+    opt->desc = SANE_DESC_PREVIEW;
+    opt->type = SANE_TYPE_BOOL;
+    opt->unit = SANE_UNIT_NONE;
+    opt->size = sizeof(SANE_Word);
+    opt->cap = SANE_CAP_SOFT_SELECT | SANE_CAP_SOFT_DETECT | SANE_CAP_AUTOMATIC;
+    opt->constraint_type = SANE_CONSTRAINT_NONE;
     break;
 
   case OPT_GEOMETRY_GROUP:
@@ -733,6 +746,42 @@ sane_ricoh_sp110_get_option_descriptor(SANE_Handle handle, SANE_Int option) {
     opt->constraint_type = SANE_CONSTRAINT_RANGE;
     opt->constraint.range = &s->threshold_range;
     break;
+
+  case OPT_NEGATIVE:
+    opt->name = SANE_NAME_NEGATIVE;
+    opt->title = SANE_TITLE_NEGATIVE;
+    opt->desc = SANE_DESC_NEGATIVE;
+    opt->type = SANE_TYPE_BOOL;
+    opt->unit = SANE_UNIT_NONE;
+    opt->size = sizeof(SANE_Word);
+    opt->cap = SANE_CAP_SOFT_SELECT | SANE_CAP_SOFT_DETECT | SANE_CAP_AUTOMATIC;
+    opt->constraint_type = SANE_CONSTRAINT_NONE;
+    break;
+
+  case OPT_SENSOR_GROUP:
+    opt->name = "";
+    opt->title = "Sensors";
+    opt->desc = "Scanner hardware sensors";
+    opt->type = SANE_TYPE_GROUP;
+    opt->unit = SANE_UNIT_NONE;
+    opt->size = 0;
+    opt->cap = 0;
+    opt->constraint_type = SANE_CONSTRAINT_NONE;
+    break;
+
+  case OPT_PAGE_LOADED:
+    opt->name = SANE_NAME_PAGE_LOADED;
+    opt->title = SANE_TITLE_PAGE_LOADED;
+    opt->desc = SANE_DESC_PAGE_LOADED;
+    opt->type = SANE_TYPE_BOOL;
+    opt->unit = SANE_UNIT_NONE;
+    opt->size = sizeof(SANE_Word);
+    opt->cap = SANE_CAP_HARD_SELECT | SANE_CAP_SOFT_DETECT;
+    if (!s->hw || s->hw->pid != PID_SP112SF) {
+      opt->cap |= SANE_CAP_INACTIVE;
+    }
+    opt->constraint_type = SANE_CONSTRAINT_NONE;
+    break;
   }
   return opt;
 }
@@ -793,6 +842,9 @@ SANE_Status sane_ricoh_sp110_control_option(SANE_Handle handle, SANE_Int option,
     case OPT_SOURCE:
       strcpy(val, s->val_source);
       break;
+    case OPT_PREVIEW:
+      *(SANE_Bool *)val = s->val_preview;
+      break;
     case OPT_PAPER_SIZE:
     case OPT_PAGE_SIZE:
       strcpy(val, s->val_paper_size ? s->val_paper_size : "Custom");
@@ -818,6 +870,18 @@ SANE_Status sane_ricoh_sp110_control_option(SANE_Handle handle, SANE_Int option,
     case OPT_THRESHOLD:
       *(SANE_Int *)val = s->val_threshold;
       break;
+    case OPT_NEGATIVE:
+      *(SANE_Bool *)val = s->val_negative;
+      break;
+    case OPT_PAGE_LOADED:
+      if (!s->scanning) {
+        int hp = 0;
+        if (query_scanner_status(s, &hp, NULL) == SANE_STATUS_GOOD) {
+          s->last_has_paper = hp ? SANE_TRUE : SANE_FALSE;
+        }
+      }
+      *(SANE_Bool *)val = s->last_has_paper;
+      break;
     default:
       return SANE_STATUS_INVAL;
     }
@@ -826,6 +890,11 @@ SANE_Status sane_ricoh_sp110_control_option(SANE_Handle handle, SANE_Int option,
 
   if (action == SANE_ACTION_SET_AUTO) {
     switch (option) {
+    case OPT_PREVIEW:
+      s->val_preview = SANE_FALSE;
+      if (info)
+        *info |= SANE_INFO_RELOAD_PARAMS;
+      return SANE_STATUS_GOOD;
     case OPT_BRIGHTNESS:
       s->val_brightness = 0;
       build_tone_lut(s);
@@ -836,6 +905,10 @@ SANE_Status sane_ricoh_sp110_control_option(SANE_Handle handle, SANE_Int option,
       return SANE_STATUS_GOOD;
     case OPT_THRESHOLD:
       s->val_threshold = 128;
+      return SANE_STATUS_GOOD;
+    case OPT_NEGATIVE:
+      s->val_negative = SANE_FALSE;
+      build_tone_lut(s);
       return SANE_STATUS_GOOD;
     default:
       return SANE_STATUS_UNSUPPORTED;
@@ -864,6 +937,11 @@ SANE_Status sane_ricoh_sp110_control_option(SANE_Handle handle, SANE_Int option,
         if (info)
           *info |= SANE_INFO_RELOAD_PARAMS | SANE_INFO_RELOAD_OPTIONS;
       }
+      break;
+    case OPT_PREVIEW:
+      s->val_preview = (*(SANE_Bool *)val) ? SANE_TRUE : SANE_FALSE;
+      if (info)
+        *info |= SANE_INFO_RELOAD_PARAMS;
       break;
     case OPT_PAPER_SIZE:
     case OPT_PAGE_SIZE:
@@ -920,6 +998,10 @@ SANE_Status sane_ricoh_sp110_control_option(SANE_Handle handle, SANE_Int option,
       s->val_threshold = v;
       break;
     }
+    case OPT_NEGATIVE:
+      s->val_negative = (*(SANE_Bool *)val) ? SANE_TRUE : SANE_FALSE;
+      build_tone_lut(s);
+      break;
     default:
       return SANE_STATUS_INVAL;
     }
@@ -934,9 +1016,10 @@ SANE_Status sane_ricoh_sp110_get_parameters(SANE_Handle handle,
   Ricoh_Scanner *s = (Ricoh_Scanner *)handle;
   double width_mm = SANE_UNFIX(s->val_br_x - s->val_tl_x);
   double height_mm = SANE_UNFIX(s->val_br_y - s->val_tl_y);
+  int eff_dpi = s->val_preview ? 75 : s->val_resolution;
 
-  int width_px = (int)((width_mm / 25.4) * s->val_resolution);
-  int height_px = (int)((height_mm / 25.4) * s->val_resolution);
+  int width_px = (int)((width_mm / 25.4) * eff_dpi);
+  int height_px = (int)((height_mm / 25.4) * eff_dpi);
 
   if (strcmp(s->val_mode, SANE_VALUE_SCAN_MODE_COLOR) == 0) {
     params->format = SANE_FRAME_RGB;
@@ -963,12 +1046,14 @@ SANE_Status sane_ricoh_sp110_get_parameters(SANE_Handle handle,
 SANE_Status sane_ricoh_sp110_start(SANE_Handle handle) {
   Ricoh_Scanner *s = (Ricoh_Scanner *)handle;
   sane_ricoh_sp110_get_parameters(handle, &s->params);
+  int eff_dpi = s->val_preview ? 75 : s->val_resolution;
 
   int has_paper = 0, cover_open = 0;
   SANE_Status st = query_scanner_status(s, &has_paper, &cover_open);
   if (st != SANE_STATUS_GOOD) {
     return st;
   }
+  s->last_has_paper = has_paper ? SANE_TRUE : SANE_FALSE;
 
   if (strcmp(s->val_source, "ADF") == 0 && !has_paper) {
     return SANE_STATUS_NO_DOCS;
@@ -979,15 +1064,27 @@ SANE_Status sane_ricoh_sp110_start(SANE_Handle handle) {
   if (send_command_packet(s->usb_handle, s->ep_out, CMD_SUBTYPE_CANCEL,
                           CMD_RESP_LEN_CANCEL, NULL, 0) == 0) {
     receive_response_packet(s->usb_handle, s->ep_in, &pre_ack, sizeof(pre_ack), 3000);
+    if (pre_ack != 0) {
+      /* Attempt one soft-reset recovery via EndScan (0x0A) */
+      send_command_packet(s->usb_handle, s->ep_out, CMD_SUBTYPE_END_SCAN,
+                          CMD_RESP_LEN_END_SCAN, NULL, 0);
+      if (send_command_packet(s->usb_handle, s->ep_out, CMD_SUBTYPE_CANCEL,
+                              CMD_RESP_LEN_CANCEL, NULL, 0) == 0) {
+        receive_response_packet(s->usb_handle, s->ep_in, &pre_ack, sizeof(pre_ack), 3000);
+      }
+      if (pre_ack != 0 && strcmp(s->val_source, "ADF") == 0) {
+        return SANE_STATUS_JAMMED;
+      }
+    }
   }
 
-  s->downscale_75 = (s->val_resolution == 75) ? SANE_TRUE : SANE_FALSE;
-  s->downscale_100 = (s->val_resolution == 100) ? SANE_TRUE : SANE_FALSE;
-  s->downscale_150 = (s->val_resolution == 150) ? SANE_TRUE : SANE_FALSE;
-  s->downscale_200 = (s->val_resolution == 200) ? SANE_TRUE : SANE_FALSE;
+  s->downscale_75 = (eff_dpi == 75) ? SANE_TRUE : SANE_FALSE;
+  s->downscale_100 = (eff_dpi == 100) ? SANE_TRUE : SANE_FALSE;
+  s->downscale_150 = (eff_dpi == 150) ? SANE_TRUE : SANE_FALSE;
+  s->downscale_200 = (eff_dpi == 200) ? SANE_TRUE : SANE_FALSE;
   /* Hardware only supports 300 DPI (0x01) and 600 DPI (0x02) optical stepping.
    * 75/100/150/200 DPI are captured at 300 DPI hardware resolution. */
-  int hw_dpi = (s->val_resolution >= 600) ? 600 : 300;
+  int hw_dpi = (eff_dpi >= 600) ? 600 : 300;
   s->hw_line_index = 0;
 
   /* Build 17-byte parameter block */
@@ -1014,8 +1111,8 @@ SANE_Status sane_ricoh_sp110_start(SANE_Handle handle) {
   if (tl_y_mm < 0.0) tl_y_mm = 0.0;
   uint16_t start_x_600 = (uint16_t)((tl_x_mm / 25.4) * 600.0);
   uint16_t start_y_600 = (uint16_t)((tl_y_mm / 25.4) * 600.0);
-  uint16_t w_600 = (uint16_t)((s->params.pixels_per_line * 600) / s->val_resolution);
-  uint16_t h_600 = (uint16_t)((s->params.lines * 600) / s->val_resolution);
+  uint16_t w_600 = (uint16_t)((s->params.pixels_per_line * 600) / eff_dpi);
+  uint16_t h_600 = (uint16_t)((s->params.lines * 600) / eff_dpi);
   if (start_x_600 + w_600 > 5100) {
     start_x_600 = (w_600 < 5100) ? (5100 - w_600) : 0;
   }
@@ -1159,7 +1256,7 @@ SANE_Status sane_ricoh_sp110_read(SANE_Handle handle, SANE_Byte *data,
     return SANE_STATUS_INVAL;
   }
   int lines_per_chunk = (hw_bpl <= 65535) ? (65535 / hw_bpl) : 1;
-  if (s->val_resolution >= 600 && lines_per_chunk > 1) {
+  if (!s->val_preview && s->val_resolution >= 600 && lines_per_chunk > 1) {
     lines_per_chunk /= 2;
   }
   if (lines_per_chunk < 1) {
