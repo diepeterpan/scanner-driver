@@ -490,7 +490,7 @@ SANE_Status sane_ricoh_sp110_open(SANE_String_Const devicename,
   s->x_range.quant = 0;
 
   s->y_range.min = SANE_FIX(0.0);
-  s->y_range.max = SANE_FIX(355.6); /* Up to Legal for ADF */
+  s->y_range.max = SANE_FIX(297.0); /* 297.0mm for Flatbed, 355.6mm for ADF */
   s->y_range.quant = 0;
 
   /* Enhancement ranges & defaults */
@@ -931,12 +931,16 @@ SANE_Status sane_ricoh_sp110_control_option(SANE_Handle handle, SANE_Int option,
     case OPT_SOURCE:
       free(s->val_source);
       s->val_source = strdup((char *)val);
-      /* If source changed to Flatbed and current height exceeds 297mm, clamp */
-      if (strcmp(s->val_source, "Flatbed") == 0 && SANE_UNFIX(s->val_br_y) > 297.0) {
-        s->val_br_y = SANE_FIX(297.0);
-        if (info)
-          *info |= SANE_INFO_RELOAD_PARAMS | SANE_INFO_RELOAD_OPTIONS;
+      if (strcmp(s->val_source, "Flatbed") == 0) {
+        s->y_range.max = SANE_FIX(297.0);
+        if (SANE_UNFIX(s->val_br_y) > 297.0) {
+          s->val_br_y = SANE_FIX(297.0);
+        }
+      } else {
+        s->y_range.max = SANE_FIX(355.6);
       }
+      if (info)
+        *info |= SANE_INFO_RELOAD_PARAMS | SANE_INFO_RELOAD_OPTIONS;
       break;
     case OPT_PREVIEW:
       s->val_preview = (*(SANE_Bool *)val) ? SANE_TRUE : SANE_FALSE;
@@ -1104,13 +1108,18 @@ SANE_Status sane_ricoh_sp110_start(SANE_Handle handle) {
 
   /* Geometry coordinates: Scaled to 600 DPI base units per original driver:
    * coord_600 = (coord_dpi * 600) / requested_dpi.
-   * For 200 DPI, (px * 600)/200 = px * 3 = 1.5 * (px at 300 DPI). */
+   * Note: We first compute the integer pixel coordinates at eff_dpi (just like
+   * the Windows WIA/TWAIN drivers do via WIA_IPS_XPOS/YPOS), so that
+   * start_x_600 and start_y_600 are always clean integer multiples of the
+   * hardware optical step (even numbers at 300 DPI). */
   double tl_x_mm = SANE_UNFIX(s->val_tl_x);
   double tl_y_mm = SANE_UNFIX(s->val_tl_y);
   if (tl_x_mm < 0.0) tl_x_mm = 0.0;
   if (tl_y_mm < 0.0) tl_y_mm = 0.0;
-  uint16_t start_x_600 = (uint16_t)((tl_x_mm / 25.4) * 600.0);
-  uint16_t start_y_600 = (uint16_t)((tl_y_mm / 25.4) * 600.0);
+  int start_x_px = (int)((tl_x_mm / 25.4) * eff_dpi);
+  int start_y_px = (int)((tl_y_mm / 25.4) * eff_dpi);
+  uint16_t start_x_600 = (uint16_t)((start_x_px * 600) / eff_dpi);
+  uint16_t start_y_600 = (uint16_t)((start_y_px * 600) / eff_dpi);
   uint16_t w_600 = (uint16_t)((s->params.pixels_per_line * 600) / eff_dpi);
   uint16_t h_600 = (uint16_t)((s->params.lines * 600) / eff_dpi);
   if (start_x_600 + w_600 > 5100) {
@@ -1183,6 +1192,15 @@ SANE_Status sane_ricoh_sp110_start(SANE_Handle handle) {
   s->hw_total_bytes = (size_t)s->hw_bytes_per_line * (size_t)s->hw_lines;
   s->expected_bytes = s->params.bytes_per_line * s->params.lines;
 
+  /* Pre-lamp ready check (Command 3, 0x09), matching Windows WIA driver
+   * (scan_session_sequence lines 158-185) which polls 0x09 after 0x0B and
+   * immediately before 0x08 (CMD_LampControl). */
+  uint8_t lamp_ack = 0;
+  if (send_command_packet(s->usb_handle, s->ep_out, CMD_SUBTYPE_CANCEL,
+                          CMD_RESP_LEN_CANCEL, NULL, 0) == 0) {
+    receive_response_packet(s->usb_handle, s->ep_in, &lamp_ack, sizeof(lamp_ack), 5000);
+  }
+
   /* Step 5: Lamp calibration & control (Command 5, 0x08): Write-Only
    * Payload: total hardware bytes (4 bytes little-endian) + 0x01 flag
    */
@@ -1250,13 +1268,15 @@ SANE_Status sane_ricoh_sp110_read(SANE_Handle handle, SANE_Byte *data,
     return SANE_STATUS_EOF;
   }
 
-  /* Buffer is empty: calculate line-aligned chunk size */
+  /* Buffer is empty: calculate line-aligned chunk size
+   * Matching Windows WIA/TWAIN drivers (scan_session_sequence / FUN_100316a0):
+   * lines_per_chunk = 65535 / hw_bpl, halved only for 600 DPI ADF mode. */
   int hw_bpl = s->hw_bytes_per_line;
   if (hw_bpl <= 0) {
     return SANE_STATUS_INVAL;
   }
   int lines_per_chunk = (hw_bpl <= 65535) ? (65535 / hw_bpl) : 1;
-  if (!s->val_preview && s->val_resolution >= 600 && lines_per_chunk > 1) {
+  if (s->adf_600_doubling && lines_per_chunk > 1) {
     lines_per_chunk /= 2;
   }
   if (lines_per_chunk < 1) {
@@ -1291,8 +1311,12 @@ SANE_Status sane_ricoh_sp110_read(SANE_Handle handle, SANE_Byte *data,
   s->out_buf_len = 0;
   s->out_buf_pos = 0;
 
-  /* Step 7: Dispatch CMD_StartScan (Command 6, 0x0E) and read full requested chunk */
-  int timeout_ms = (s->hw_bytes_received == 0) ? 20000 : 10000;
+  /* Step 7: Dispatch CMD_StartScan (Command 6, 0x0E) and read full requested chunk.
+   * Use 90000 ms (90s) timeout on the first chunk to match the Windows WIA driver
+   * (FUN_180016230: 0x5A = 90s), as region scans further down the flatbed require
+   * the carriage to home, calibrate the lamp, and step down to StartY before the
+   * first scanline is captured. */
+  int timeout_ms = (s->hw_bytes_received == 0) ? 90000 : 30000;
   int transferred = fetch_raster_chunk(s, s->raw_chunk_buf, to_fetch, timeout_ms);
 
   if (transferred <= 0) {
@@ -1349,6 +1373,7 @@ SANE_Status sane_ricoh_sp110_read(SANE_Handle handle, SANE_Byte *data,
         const uint8_t *b_plane = hw_line + hw_pitch * 2;
         for (int p = 0; p < active_pixels; p++) {
           int src_p = (p / 2) * 3 + (p % 2);
+          if (src_p >= hw_pitch) src_p = hw_pitch - 1;
           dst[p * 3 + 0] = lut[r_plane[src_p]];
           dst[p * 3 + 1] = lut[g_plane[src_p]];
           dst[p * 3 + 2] = lut[b_plane[src_p]];
@@ -1356,6 +1381,7 @@ SANE_Status sane_ricoh_sp110_read(SANE_Handle handle, SANE_Byte *data,
       } else if (strcmp(s->val_mode, SANE_VALUE_SCAN_MODE_GRAY) == 0) {
         for (int p = 0; p < active_pixels; p++) {
           int src_p = (p / 2) * 3 + (p % 2);
+          if (src_p >= hw_pitch) src_p = hw_pitch - 1;
           dst[p] = lut[hw_line[src_p]];
         }
       } else {
@@ -1363,6 +1389,7 @@ SANE_Status sane_ricoh_sp110_read(SANE_Handle handle, SANE_Byte *data,
         memset(dst, 0, (size_t)out_bpl);
         for (int p = 0; p < active_pixels; p++) {
           int src_p = (p / 2) * 3 + (p % 2);
+          if (src_p >= hw_pitch) src_p = hw_pitch - 1;
           if (lut[hw_line[src_p]] < threshold) {
             dst[p / 8] |= (uint8_t)(1 << (7 - (p % 8)));
           }
@@ -1376,19 +1403,24 @@ SANE_Status sane_ricoh_sp110_read(SANE_Handle handle, SANE_Byte *data,
         const uint8_t *b_plane = hw_line + hw_pitch * 2;
         for (int p = 0; p < active_pixels; p++) {
           int src_p = p * 2;
+          if (src_p >= hw_pitch) src_p = hw_pitch - 1;
           dst[p * 3 + 0] = lut[r_plane[src_p]];
           dst[p * 3 + 1] = lut[g_plane[src_p]];
           dst[p * 3 + 2] = lut[b_plane[src_p]];
         }
       } else if (strcmp(s->val_mode, SANE_VALUE_SCAN_MODE_GRAY) == 0) {
         for (int p = 0; p < active_pixels; p++) {
-          dst[p] = lut[hw_line[p * 2]];
+          int src_p = p * 2;
+          if (src_p >= hw_pitch) src_p = hw_pitch - 1;
+          dst[p] = lut[hw_line[src_p]];
         }
       } else {
         /* 1-bit Lineart */
         memset(dst, 0, (size_t)out_bpl);
         for (int p = 0; p < active_pixels; p++) {
-          if (lut[hw_line[p * 2]] < threshold) {
+          int src_p = p * 2;
+          if (src_p >= hw_pitch) src_p = hw_pitch - 1;
+          if (lut[hw_line[src_p]] < threshold) {
             dst[p / 8] |= (uint8_t)(1 << (7 - (p % 8)));
           }
         }
@@ -1401,19 +1433,24 @@ SANE_Status sane_ricoh_sp110_read(SANE_Handle handle, SANE_Byte *data,
         const uint8_t *b_plane = hw_line + hw_pitch * 2;
         for (int p = 0; p < active_pixels; p++) {
           int src_p = p * 3;
+          if (src_p >= hw_pitch) src_p = hw_pitch - 1;
           dst[p * 3 + 0] = lut[r_plane[src_p]];
           dst[p * 3 + 1] = lut[g_plane[src_p]];
           dst[p * 3 + 2] = lut[b_plane[src_p]];
         }
       } else if (strcmp(s->val_mode, SANE_VALUE_SCAN_MODE_GRAY) == 0) {
         for (int p = 0; p < active_pixels; p++) {
-          dst[p] = lut[hw_line[p * 3]];
+          int src_p = p * 3;
+          if (src_p >= hw_pitch) src_p = hw_pitch - 1;
+          dst[p] = lut[hw_line[src_p]];
         }
       } else {
         /* 1-bit Lineart */
         memset(dst, 0, (size_t)out_bpl);
         for (int p = 0; p < active_pixels; p++) {
-          if (lut[hw_line[p * 3]] < threshold) {
+          int src_p = p * 3;
+          if (src_p >= hw_pitch) src_p = hw_pitch - 1;
+          if (lut[hw_line[src_p]] < threshold) {
             dst[p / 8] |= (uint8_t)(1 << (7 - (p % 8)));
           }
         }
@@ -1426,19 +1463,24 @@ SANE_Status sane_ricoh_sp110_read(SANE_Handle handle, SANE_Byte *data,
         const uint8_t *b_plane = hw_line + hw_pitch * 2;
         for (int p = 0; p < active_pixels; p++) {
           int src_p = p * 4;
+          if (src_p >= hw_pitch) src_p = hw_pitch - 1;
           dst[p * 3 + 0] = lut[r_plane[src_p]];
           dst[p * 3 + 1] = lut[g_plane[src_p]];
           dst[p * 3 + 2] = lut[b_plane[src_p]];
         }
       } else if (strcmp(s->val_mode, SANE_VALUE_SCAN_MODE_GRAY) == 0) {
         for (int p = 0; p < active_pixels; p++) {
-          dst[p] = lut[hw_line[p * 4]];
+          int src_p = p * 4;
+          if (src_p >= hw_pitch) src_p = hw_pitch - 1;
+          dst[p] = lut[hw_line[src_p]];
         }
       } else {
         /* 1-bit Lineart */
         memset(dst, 0, (size_t)out_bpl);
         for (int p = 0; p < active_pixels; p++) {
-          if (lut[hw_line[p * 4]] < threshold) {
+          int src_p = p * 4;
+          if (src_p >= hw_pitch) src_p = hw_pitch - 1;
+          if (lut[hw_line[src_p]] < threshold) {
             dst[p / 8] |= (uint8_t)(1 << (7 - (p % 8)));
           }
         }
@@ -1451,19 +1493,22 @@ SANE_Status sane_ricoh_sp110_read(SANE_Handle handle, SANE_Byte *data,
         const uint8_t *g_plane = hw_line + hw_pitch;
         const uint8_t *b_plane = hw_line + hw_pitch * 2;
         for (int p = 0; p < active_pixels; p++) {
-          dst[p * 3 + 0] = lut[r_plane[p]];
-          dst[p * 3 + 1] = lut[g_plane[p]];
-          dst[p * 3 + 2] = lut[b_plane[p]];
+          int src_p = (p < hw_pitch) ? p : (hw_pitch - 1);
+          dst[p * 3 + 0] = lut[r_plane[src_p]];
+          dst[p * 3 + 1] = lut[g_plane[src_p]];
+          dst[p * 3 + 2] = lut[b_plane[src_p]];
         }
       } else if (strcmp(s->val_mode, SANE_VALUE_SCAN_MODE_GRAY) == 0) {
         for (int p = 0; p < active_pixels; p++) {
-          dst[p] = lut[hw_line[p]];
+          int src_p = (p < hw_pitch) ? p : (hw_pitch - 1);
+          dst[p] = lut[hw_line[src_p]];
         }
       } else {
         /* 1-bit Lineart: threshold 8-bit grayscale at s->val_threshold (0=white, 1=black per SANE standard) */
         memset(dst, 0, (size_t)out_bpl);
         for (int p = 0; p < active_pixels; p++) {
-          if (lut[hw_line[p]] < threshold) {
+          int src_p = (p < hw_pitch) ? p : (hw_pitch - 1);
+          if (lut[hw_line[src_p]] < threshold) {
             dst[p / 8] |= (uint8_t)(1 << (7 - (p % 8)));
           }
         }
